@@ -1,0 +1,290 @@
+name: Build Revoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - '*.zip'
+      - 'Revoke/**'
+      - 'Revoke-DEV/**'
+      - 'app_src/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------- обычный Revoke (папка Revoke/ внутри zip) ----------
+  revoke:
+    name: Revoke APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Unpack project zip
+        run: |
+          echo "--- repo files ---"; find . -path ./.git -prune -o -maxdepth 3 \( -type f -o -type d \) -print | head -60
+          ROOTDIR=.
+          DEV=$(find . -path ./.git -prune -o -maxdepth 8 -type d -name app_src -print | head -n 1)
+          REG=$(find . -path ./.git -prune -o -maxdepth 6 -type f -path "*/Revoke/pubspec.yaml" -print | head -n 1)
+          if [ -z "$DEV" ] && [ -z "$REG" ]; then
+            ZIP=$(find . -path ./.git -prune -o -type f -iname "*.zip" -printf '%T@ %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
+            if [ -n "$ZIP" ]; then
+              echo "::notice::Building from $ZIP"
+              mkdir -p project && unzip -q "$ZIP" -d project
+              ROOTDIR=project
+              DEV=$(find "$ROOTDIR" -maxdepth 8 -type d -name app_src | head -n 1)
+              REG=$(find "$ROOTDIR" -maxdepth 6 -type f -path "*/Revoke/pubspec.yaml" | head -n 1)
+            fi
+          fi
+          [ -n "$REG" ] && echo "PROJ=$(dirname "$REG")" >> "$GITHUB_ENV" || echo "PROJ=" >> "$GITHUB_ENV"
+          echo "SRC=$DEV" >> "$GITHUB_ENV"
+          echo "regular: ${REG:-none}  dev: ${DEV:-none}"
+
+      - name: Skip notice
+        if: env.PROJ == ''
+        run: echo "::notice::Revoke/ (regular app) not found in the zip, skipping"
+
+      - uses: actions/setup-java@v4
+        if: env.PROJ != ''
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        if: env.PROJ != ''
+        with:
+          flutter-version: '3.44.3'
+          channel: stable
+          cache: true
+
+      - name: Install Rust toolchain
+        if: env.PROJ != ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Rust build
+        if: env.PROJ != ''
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ env.PROJ }}/native/komet_crypto/rust
+
+      - name: Fetch rlottie (submodule missing in zip)
+        if: env.PROJ != ''
+        run: |
+          if [ ! -f "$PROJ/third_party/rlottie/src/CMakeLists.txt" ]; then
+            rm -rf "$PROJ/third_party/rlottie"
+            git clone --depth 1 https://github.com/Samsung/rlottie.git "$PROJ/third_party/rlottie"
+          fi
+
+      - name: Get dependencies
+        if: env.PROJ != ''
+        working-directory: ${{ env.PROJ }}
+        run: |
+          fail() { grep -nE "Error|error:|FAILED|e: |Could not|Because|version solving|What went wrong|Unresolved|not found|cannot" "$1" | head -12 | cut -c1-280 | while IFS= read -r l; do echo "::error::$l"; done; echo "::error::TAIL: $(tail -8 "$1" | cut -c1-200 | tr '\n' '|')"; exit 1; }
+          flutter pub get 2>&1 | tee /tmp/pub.log; [ ${PIPESTATUS[0]} -eq 0 ] || fail /tmp/pub.log
+
+      - name: Configure Gradle
+        if: env.PROJ != ''
+        run: |
+          mkdir -p ~/.gradle
+          echo "org.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1024m" >> ~/.gradle/gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx1536m" >> ~/.gradle/gradle.properties
+
+      - name: Build Revoke APK (arm64)
+        if: env.PROJ != ''
+        working-directory: ${{ env.PROJ }}
+        run: |
+          fail() { grep -nE "Error|error:|FAILED|e: |Could not|What went wrong" /tmp/rv.log | head -12 | cut -c1-280 | while IFS= read -r l; do echo "::error::$l"; done; echo "::error::TAIL: $(tail -8 /tmp/rv.log | cut -c1-200 | tr '\n' '|')"; exit 1; }
+          flutter build apk --release --split-per-abi --flavor komet --obfuscate --split-debug-info=build/symbols 2>&1 | tee /tmp/rv.log; [ ${PIPESTATUS[0]} -eq 0 ] || fail
+          cp build/app/outputs/flutter-apk/app-arm64-v8a-komet-release.apk "$GITHUB_WORKSPACE/Revoke.apk"
+
+      - name: Upload Revoke APK
+        if: env.PROJ != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: Revoke-APK
+          path: Revoke.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------- Revoke DEV (папка app_src внутри zip) ----------
+  revoke-dev:
+    name: Revoke DEV APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: |
+          echo "--- repo files ---"; find . -path ./.git -prune -o -maxdepth 3 \( -type f -o -type d \) -print | head -60
+          ROOTDIR=.
+          DEV=$(find . -path ./.git -prune -o -maxdepth 8 -type d -name app_src -print | head -n 1)
+          REG=$(find . -path ./.git -prune -o -maxdepth 6 -type f -path "*/Revoke/pubspec.yaml" -print | head -n 1)
+          if [ -z "$DEV" ] && [ -z "$REG" ]; then
+            ZIP=$(find . -path ./.git -prune -o -type f -iname "*.zip" -printf '%T@ %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
+            if [ -n "$ZIP" ]; then
+              echo "::notice::Building from $ZIP"
+              mkdir -p project && unzip -q "$ZIP" -d project
+              ROOTDIR=project
+              DEV=$(find "$ROOTDIR" -maxdepth 8 -type d -name app_src | head -n 1)
+              REG=$(find "$ROOTDIR" -maxdepth 6 -type f -path "*/Revoke/pubspec.yaml" | head -n 1)
+            fi
+          fi
+          [ -n "$REG" ] && echo "PROJ=$(dirname "$REG")" >> "$GITHUB_ENV" || echo "PROJ=" >> "$GITHUB_ENV"
+          echo "SRC=$DEV" >> "$GITHUB_ENV"
+          echo "regular: ${REG:-none}  dev: ${DEV:-none}"
+
+      - name: Check sources
+        run: test -n "$SRC" || { echo "::error::app_src not found (put a .zip with app_src in the repo root)"; exit 1; }
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create Android project
+        run: |
+          flutter create --platforms=android --org ru.revoke --project-name app build_app
+          cp -R "$SRC"/. build_app/
+
+      - name: Apply app icon, name and deep link
+        run: |
+          if [ -d "$SRC/android_res" ]; then cp -R "$SRC"/android_res/. build_app/android/app/src/main/res/; fi
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          import re
+          p = Path('build_app/android/app/src/main/AndroidManifest.xml')
+          s = p.read_text()
+          s = re.sub(r'android:label="[^"]*"', 'android:label="Revoke"', s)
+          intent = """<intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="revoke" android:host="login-callback" />
+            </intent-filter>"""
+          s = s.replace('</activity>', intent + '\n        </activity>', 1)
+          s = s.replace('<application', '<uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"/>\n    <application', 1)
+          service = """<service
+                android:name=".VpnTileService"
+                android:label="Revoke"
+                android:icon="@drawable/ic_tile"
+                android:exported="true"
+                android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+                <intent-filter>
+                    <action android:name="android.service.quicksettings.action.QS_TILE" />
+                </intent-filter>
+                <meta-data android:name="android.service.quicksettings.ACTIVE_TILE" android:value="true" />
+            </service>"""
+          s = s.replace('</application>', service + '\n    </application>', 1)
+          p.write_text(s)
+          PYCODE
+          mkdir -p build_app/android/app/src/main/kotlin/ru/revoke/app
+          cp "$SRC"/android_kotlin/*.kt build_app/android/app/src/main/kotlin/ru/revoke/app/
+
+      - name: Set Android minimum SDK
+        working-directory: build_app
+        run: sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+
+      - name: Disable lint (crashes on runner JDK)
+        working-directory: build_app
+        run: |
+          python3 - <<'PY'
+          p='android/app/build.gradle.kts'
+          s=open(p).read()
+          if 'checkReleaseBuilds' not in s:
+              s=s.replace('android {','android {\n    lint { checkReleaseBuilds = false\n        abortOnError = false }',1)
+          open(p,'w').write(s)
+          PY
+
+      - name: Get dependencies
+        working-directory: build_app
+        run: |
+          fail() { grep -nE "Error|error:|FAILED|e: |Could not|Because|version solving|What went wrong|Unresolved|not found|cannot" "$1" | head -12 | cut -c1-280 | while IFS= read -r l; do echo "::error::$l"; done; echo "::error::TAIL: $(tail -8 "$1" | cut -c1-200 | tr '\n' '|')"; exit 1; }
+          flutter pub get 2>&1 | tee /tmp/pub.log; [ ${PIPESTATUS[0]} -eq 0 ] || fail /tmp/pub.log
+
+      - name: Build Revoke VPN APK (key login, no dev mode)
+        working-directory: build_app
+        run: |
+          sed -i 's|<script>window.CVPN_DEV=true;</script>||' assets/index.html
+          grep -c 'window.CVPN_DEV=true;</script>' assets/index.html || true
+          fail() { grep -nE "Error|error:|FAILED|e: |Could not|What went wrong" /tmp/vpn.log | head -12 | cut -c1-280 | while IFS= read -r l; do echo "::error::$l"; done; exit 1; }
+          flutter build apk --release --target-platform android-arm64 2>&1 | tee /tmp/vpn.log; [ ${PIPESTATUS[0]} -eq 0 ] || fail
+          cp build/app/outputs/flutter-apk/app-release.apk ../Revoke-VPN.apk
+          cp "../$SRC/assets/index.html" assets/index.html 2>/dev/null || cp "$GITHUB_WORKSPACE/$SRC/assets/index.html" assets/index.html
+
+      - name: Upload Revoke VPN APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Revoke-VPN-APK
+          path: Revoke-VPN.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build Revoke DEV APK
+        working-directory: build_app
+        run: |
+          sed -i 's/applicationId = "ru.revoke.app"/applicationId = "ru.revoke.app.dev"/' android/app/build.gradle.kts
+          sed -i 's/android:label="Revoke"/android:label="Revoke DEV"/' android/app/src/main/AndroidManifest.xml
+          fail() { grep -nE "Error|error:|FAILED|e: |Could not|What went wrong" /tmp/dev.log | head -12 | cut -c1-280 | while IFS= read -r l; do echo "::error::$l"; done; echo "::error::TAIL: $(tail -8 /tmp/dev.log | cut -c1-200 | tr '\n' '|')"; exit 1; }
+          flutter build apk --release --target-platform android-arm64 --dart-define=CVPN_DEV=true 2>&1 | tee /tmp/dev.log; [ ${PIPESTATUS[0]} -eq 0 ] || fail
+          cp build/app/outputs/flutter-apk/app-release.apk ../Revoke-DEV.apk
+
+      - name: Upload Revoke DEV APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Revoke-DEV-APK
+          path: Revoke-DEV.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  revoke-ios:
+    name: Revoke iOS (unsigned IPA, UI only)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: |
+          DEV=$(find . -path ./.git -prune -o -maxdepth 8 -type d -name app_src -print | head -n 1)
+          if [ -z "$DEV" ]; then
+            ZIP=$(find . -path ./.git -prune -o -type f -iname "*.zip" -print | head -n 1)
+            mkdir -p project && unzip -q "$ZIP" -d project
+            DEV=$(find project -maxdepth 8 -type d -name app_src | head -n 1)
+          fi
+          test -n "$DEV" || { echo "::error::app_src not found"; exit 1; }
+          echo "SRC=$DEV" >> "$GITHUB_ENV"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Create iOS project
+        run: |
+          flutter create --platforms=ios --org ru.revoke --project-name app build_ios
+          cp -R "$SRC"/lib build_ios/ && cp -R "$SRC"/assets build_ios/ && cp "$SRC"/pubspec.yaml build_ios/
+          sed -i '' 's|<script>window.CVPN_DEV=true;</script>||' build_ios/assets/index.html
+          cd build_ios && /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Revoke" ios/Runner/Info.plist || true
+
+      - name: Build unsigned IPA
+        working-directory: build_ios
+        run: |
+          flutter pub get
+          flutter build ios --release --no-codesign
+          mkdir -p Payload && cp -R build/ios/iphoneos/Runner.app Payload/
+          zip -qr "$GITHUB_WORKSPACE/Revoke-iOS.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Revoke-iOS-IPA
+          path: Revoke-iOS.ipa
